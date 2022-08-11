@@ -1,5 +1,8 @@
 generated/
 build/
+Reference/
+
+**/.DS_Store
 
 ############################
 ##### Default Template #####

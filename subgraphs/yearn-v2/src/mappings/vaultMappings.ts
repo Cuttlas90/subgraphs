@@ -1,380 +1,360 @@
-import { BigInt, BigDecimal, Address, ethereum, log } from "@graphprotocol/graph-ts"
-import {
-  Registry as RegistryContract,
-} from "../../generated/Registry/Registry"
-import {
-  Vault as VaultContract,
-  Deposit as DepositEvent,
-  Withdraw as WithdrawEvent,
-  DepositCall, Deposit1Call, Deposit2Call,
-  WithdrawCall, Withdraw1Call, Withdraw2Call,
-  UpdateManagementFee as UpdateManagementFeeEvent,
-  UpdatePerformanceFee as UpdatePerformanceFeeEvent,
-} from "../../generated/Registry/Vault"
+import * as constants from "../common/constants";
+import { BigInt, log } from "@graphprotocol/graph-ts";
 import {
   Vault as VaultStore,
   VaultFee as VaultFeeStore,
-  Deposit as DepositTransaction,
-  Withdraw as WithdrawTransaction,
-  UsageMetricsDailySnapshot,
-  _Account,
-  _DailyActiveAccount,
-  FinancialsDailySnapshot,
-  YieldAggregator,
-} from "../../generated/schema"
-import { BIGDECIMAL_ZERO, BIGINT_MAX, BIGINT_ZERO, ETH_MAINNET_REGISTRY_ADDRESS, PROTOCOL_ID, SECONDS_PER_DAY, VaultFeeType } from "../common/constants"
-import { bigIntToPercentage, getTimestampInMillis } from "../common/utils"
-import { getOrCreateToken } from "../common/tokens"
-import { normalizedUsdcPrice, usdcPrice } from "../price/usdcOracle"
+} from "../../generated/schema";
+import {
+  updateFinancials,
+  updateUsageMetrics,
+  updateVaultSnapshots,
+} from "../modules/Metrics";
+import {
+  DepositCall,
+  Deposit1Call,
+  Deposit2Call,
+  WithdrawCall,
+  Withdraw1Call,
+  Withdraw2Call,
+  Vault as VaultContract,
+  Deposit as DepositEvent,
+  Withdraw as WithdrawEvent,
+  StrategyAdded as StrategyAddedV1Event,
+  StrategyAdded1 as StrategyAddedV2Event,
+  StrategyReported as OldStrategyReportedEvent,
+  StrategyReported1 as NewStrategyReportedEvent,
+  UpdateManagementFee as UpdateManagementFeeEvent,
+  UpdatePerformanceFee as UpdatePerformanceFeeEvent,
+} from "../../generated/Registry_v1/Vault";
+import { _Deposit } from "../modules/Deposit";
+import { _Withdraw } from "../modules/Withdraw";
+import { enumToPrefix } from "../common/strings";
+import { strategyReported } from "../modules/Strategy";
+import { getOrCreateStrategy, getOrCreateVault } from "../common/initializers";
+import { Strategy as StrategyTemplate } from "../../generated/templates";
 
-export function handleDepositEvent(event: DepositEvent): void {
-  log.info('[Vault mappings] Handle deposit event', []);
-  let vaultContract = VaultContract.bind(event.address)
+export function handleStrategyAdded_v1(event: StrategyAddedV1Event): void {
+  const vaultAddress = event.address;
+  const strategyAddress = event.params.strategy;
+  const performanceFee = event.params.performanceFee;
 
-  let vault = VaultStore.load(event.address.toHexString())
-  if (!vault) {
-    vault = new VaultStore(event.address.toHexString())
+  let vault = getOrCreateVault(vaultAddress, event.block);
+  if (vault) {
+    let strategy = getOrCreateStrategy(
+      vaultAddress,
+      strategyAddress,
+      performanceFee
+    );
+
+    StrategyTemplate.create(strategyAddress);
+    strategy.save();
+
+    log.warning("[SetStrategy_v1] TxHash: {}, VaultId: {}, Strategy: {}", [
+      event.transaction.hash.toHexString(),
+      vaultAddress.toHexString(),
+      strategyAddress.toHexString(),
+    ]);
   }
-  vault.save()
 }
 
-export function handleWithdrawalEvent(event: WithdrawEvent): void {
-  log.info('[Vault mappings] Handle withdraw event', [])
-  let vaultContract = VaultContract.bind(event.address)
+export function handleStrategyAdded_v2(event: StrategyAddedV2Event): void {
+  const vaultAddress = event.address;
+  const strategyAddress = event.params.strategy;
+  const performanceFee = event.params.performanceFee;
 
-  let vault = VaultStore.load(event.address.toHexString())
-  if (!vault) {
-    vault = new VaultStore(event.address.toHexString())
+  let vault = getOrCreateVault(vaultAddress, event.block);
+  if (vault) {
+    let strategy = getOrCreateStrategy(
+      vaultAddress,
+      strategyAddress,
+      performanceFee
+    );
+
+    StrategyTemplate.create(strategyAddress);
+    strategy.save();
+
+    log.warning("[SetStrategy_v2] TxHash: {}, VaultId: {}, Strategy: {}", [
+      event.transaction.hash.toHexString(),
+      vaultAddress.toHexString(),
+      strategyAddress.toHexString(),
+    ]);
   }
-  vault.save()
 }
 
 export function handleDeposit(call: DepositCall): void {
-  log.info('[Vault mappings] Handle deposit', [])
-  const vaultAddress = call.to
-  let vault = VaultStore.load(vaultAddress.toString())
+  const vaultAddress = call.to;
+  const vault = getOrCreateVault(vaultAddress, call.block);
+
   if (vault) {
-    let sharesMinted  = call.outputs.value0
-    let depositAmount = BIGINT_MAX // Deposit amount has a default argument value of BIGINT_MAX
-    deposit(call, vault, depositAmount, sharesMinted)
+    let sharesMinted = call.outputs.value0;
+
+    _Deposit(call.to, call.transaction, call.block, vault, sharesMinted, null);
   }
-  updateFinancials(call.block.number, call.block.timestamp, call.from)
-  updateUsageMetrics(call.block.number, call.block.timestamp, call.from)
+  updateFinancials(call.block);
+  updateUsageMetrics(call.block, call.from);
+  updateVaultSnapshots(vaultAddress, call.block);
 }
 
 export function handleDepositWithAmount(call: Deposit1Call): void {
-  log.info('[Vault mappings] Handle deposit with amount {}, vault {}', [call.inputs._amount.toString(), call.to.toHexString()])
   const vaultAddress = call.to;
-  let vault = VaultStore.load(vaultAddress.toHexString())
+  const vault = getOrCreateVault(vaultAddress, call.block);
+
+  log.warning("[DepositWithAmount] vault: {}, shares: {}, deposit: {}", [
+    vaultAddress.toHexString(),
+    call.outputs.value0.toString(),
+    call.inputs._amount.toString(),
+  ]);
+
   if (vault) {
-    let sharesMinted  = call.outputs.value0
-    let depositAmount = call.inputs._amount
-    deposit(call, vault, depositAmount, sharesMinted)
+    let sharesMinted = call.outputs.value0;
+    let depositAmount = call.inputs._amount;
+
+    _Deposit(
+      call.to,
+      call.transaction,
+      call.block,
+      vault,
+      sharesMinted,
+      depositAmount
+    );
   }
-  updateFinancials(call.block.number, call.block.timestamp, call.from)
-  updateUsageMetrics(call.block.number, call.block.timestamp, call.from)
+  updateFinancials(call.block);
+  updateUsageMetrics(call.block, call.from);
+  updateVaultSnapshots(vaultAddress, call.block);
 }
 
 export function handleDepositWithAmountAndRecipient(call: Deposit2Call): void {
-  log.info('[Vault mappings] Handle deposit with amount {}, vault {}', [call.inputs._amount.toString(), call.to.toHexString()]);
   const vaultAddress = call.to;
-  let vault = VaultStore.load(vaultAddress.toHexString());
+  const vault = getOrCreateVault(vaultAddress, call.block);
+
+  log.warning(
+    "[DepositWithAmountAndRecipient] vault: {}, shares: {}, deposit: {}, TxnHash: {}",
+    [
+      vaultAddress.toHexString(),
+      call.outputs.value0.toString(),
+      call.inputs._amount.toString(),
+      call.transaction.hash.toHexString(),
+    ]
+  );
+
   if (vault) {
-    let sharesMinted  = call.outputs.value0
-    let depositAmount = call.inputs._amount
-    deposit(call, vault, depositAmount, sharesMinted)
+    let sharesMinted = call.outputs.value0;
+    let depositAmount = call.inputs._amount;
+
+    _Deposit(
+      call.to,
+      call.transaction,
+      call.block,
+      vault,
+      sharesMinted,
+      depositAmount
+    );
   }
-  updateFinancials(call.block.number, call.block.timestamp, call.from)
-  updateUsageMetrics(call.block.number, call.block.timestamp, call.from)
-}
-
-function deposit(call: ethereum.Call, vault: VaultStore, depositAmount: BigInt, sharesMinted: BigInt): void {
-  const vaultAddress = Address.fromString(vault.id)
-
-  // If _amount is uint256.max, the vault contract treats this like deposit()
-  // https://github.com/yearn/yearn-vaults/blob/main/contracts/Vault.vy#L894-L897
-  if (depositAmount == BIGINT_MAX) {
-    depositAmount = calculateAmountDeposited(vaultAddress, sharesMinted)
-  }
-
-  const token = getOrCreateToken(Address.fromString(vault.inputTokens[0]))
-  const amountUSD = normalizedUsdcPrice(usdcPrice(token, depositAmount))
-  vault.totalVolumeUSD = vault.totalVolumeUSD.plus(amountUSD)
-
-  const vaultContract = VaultContract.bind(call.to)
-  const tvl = vaultContract.totalAssets()
-  vault.totalValueLockedUSD = normalizedUsdcPrice(usdcPrice(token, tvl))
-
-  vault.inputTokenBalances = [vault.inputTokenBalances[0].plus(depositAmount.toBigDecimal())]
-  vault.outputTokenSupply = vault.outputTokenSupply.plus(sharesMinted.toBigDecimal())
-  vault.save();
-
-  getOrCreateDepositTransactionFromCall(call, depositAmount.toBigDecimal(), amountUSD, 'vault.deposit()')
+  updateFinancials(call.block);
+  updateUsageMetrics(call.block, call.from);
+  updateVaultSnapshots(vaultAddress, call.block);
 }
 
 export function handleWithdraw(call: WithdrawCall): void {
-  log.info('[Vault mappings] Handle withdraw. TX hash: {}', [
-    call.transaction.hash.toHexString(),
-  ]);
   const vaultAddress = call.to;
-  let vault = VaultStore.load(vaultAddress.toHexString());
+  const vault = getOrCreateVault(vaultAddress, call.block);
+
   if (vault) {
     let vaultContract = VaultContract.bind(call.to);
     let withdrawAmount = call.outputs.value0;
     let totalAssets = vaultContract.totalAssets();
     let totalSupply = vaultContract.totalSupply();
-    let sharesBurnt = totalAssets.equals(BIGINT_ZERO)
+    let sharesBurnt = totalAssets.equals(constants.BIGINT_ZERO)
       ? withdrawAmount
       : withdrawAmount.times(totalSupply).div(totalAssets);
 
-      withdraw(call, vault, withdrawAmount, sharesBurnt)
+    _Withdraw(
+      call.to,
+      call.transaction,
+      call.block,
+      vault,
+      withdrawAmount,
+      sharesBurnt
+    );
   }
-  updateFinancials(call.block.number, call.block.timestamp, call.from)
-  updateUsageMetrics(call.block.number, call.block.timestamp, call.from)
+  updateFinancials(call.block);
+  updateUsageMetrics(call.block, call.from);
+  updateVaultSnapshots(vaultAddress, call.block);
 }
 
 export function handleWithdrawWithShares(call: Withdraw1Call): void {
-  log.info('[Vault mappings] Handle withdraw with shares. TX hash: {}', [
-    call.transaction.hash.toHexString(),
-  ]);
   const vaultAddress = call.to;
-  let vault = VaultStore.load(vaultAddress.toHexString());
+  const vault = getOrCreateVault(vaultAddress, call.block);
+
   if (vault) {
-    const sharesBurnt    = call.inputs._shares
-    const withdrawAmount = call.outputs.value0
-    withdraw(call, vault, withdrawAmount, sharesBurnt)
+    const sharesBurnt = call.inputs._shares;
+    const withdrawAmount = call.outputs.value0;
+
+    _Withdraw(
+      call.to,
+      call.transaction,
+      call.block,
+      vault,
+      withdrawAmount,
+      sharesBurnt
+    );
   }
-  updateFinancials(call.block.number, call.block.timestamp, call.from)
-  updateUsageMetrics(call.block.number, call.block.timestamp, call.from)
+  updateFinancials(call.block);
+  updateUsageMetrics(call.block, call.from);
+  updateVaultSnapshots(vaultAddress, call.block);
 }
 
 export function handleWithdrawWithSharesAndRecipient(
   call: Withdraw2Call
 ): void {
-  log.info(
-    '[Vault mappings] Handle withdraw with shares and recipient. TX hash: {}',
-    [call.transaction.hash.toHexString()]
-  );
   const vaultAddress = call.to;
-  let vault = VaultStore.load(vaultAddress.toHexString());
+  const vault = getOrCreateVault(vaultAddress, call.block);
+
   if (vault) {
-    const sharesBurnt    = call.inputs._shares
-    const withdrawAmount = call.outputs.value0
-    withdraw(call, vault, withdrawAmount, sharesBurnt)
+    const sharesBurnt = call.inputs._shares;
+    const withdrawAmount = call.outputs.value0;
+
+    _Withdraw(
+      call.to,
+      call.transaction,
+      call.block,
+      vault,
+      withdrawAmount,
+      sharesBurnt
+    );
   }
-  updateFinancials(call.block.number, call.block.timestamp, call.from)
-  updateUsageMetrics(call.block.number, call.block.timestamp, call.from)
+  updateFinancials(call.block);
+  updateUsageMetrics(call.block, call.from);
+  updateVaultSnapshots(vaultAddress, call.block);
 }
 
-export function handleUpdatePerformanceFee(event: UpdatePerformanceFeeEvent): void {
-  let vault = VaultStore.load(event.address.toHexString())
+export function handleUpdatePerformanceFee(
+  event: UpdatePerformanceFeeEvent
+): void {
+  const vaultAddress = event.address.toHexString();
+  const vault = VaultStore.load(vaultAddress);
+
   if (vault) {
-    for (let i = 0; i < vault.fees.length; i++) {
-      let fee = VaultFeeStore.load(vault.fees[i])
-      if (fee && fee.feeType == VaultFeeType.PERFORMANCE_FEE) {
-        fee.feePercentage = bigIntToPercentage(event.params.performanceFee)
-        fee.save()
-      }
+    let performanceFeeId =
+      enumToPrefix(constants.VaultFeeType.PERFORMANCE_FEE) + vaultAddress;
+    const performanceFee = VaultFeeStore.load(performanceFeeId);
+
+    if (!performanceFee) {
+      return;
     }
+
+    performanceFee.feePercentage = event.params.performanceFee
+      .div(BigInt.fromI32(100))
+      .toBigDecimal();
+    performanceFee.save();
+
+    log.warning("[updatePerformanceFee]\n TxHash: {}, performanceFee: {}", [
+      event.transaction.hash.toHexString(),
+      event.params.performanceFee.toString(),
+    ]);
   }
 }
 
-export function handleUpdateManagementFee(event: UpdateManagementFeeEvent): void {
-  let vault = VaultStore.load(event.address.toHexString())
+export function handleUpdateManagementFee(
+  event: UpdateManagementFeeEvent
+): void {
+  const vaultAddress = event.address.toHexString();
+  const vault = VaultStore.load(vaultAddress);
+
   if (vault) {
-    for (let i = 0; i < vault.fees.length; i++) {
-      let fee = VaultFeeStore.load(vault.fees[i])
-      if (fee && fee.feeType == VaultFeeType.MANAGEMENT_FEE) {
-        fee.feePercentage = bigIntToPercentage(event.params.managementFee)
-        fee.save()
-      }
+    let performanceFeeId =
+      enumToPrefix(constants.VaultFeeType.MANAGEMENT_FEE) + vaultAddress;
+    const performanceFee = VaultFeeStore.load(performanceFeeId);
+
+    if (!performanceFee) {
+      return;
     }
+
+    performanceFee.feePercentage = event.params.managementFee
+      .div(BigInt.fromI32(100))
+      .toBigDecimal();
+    performanceFee.save();
+
+    log.warning("[updateManagementFee]\n TxHash: {}, managementFee: {}", [
+      event.transaction.hash.toHexString(),
+      event.params.managementFee.toString(),
+    ]);
   }
 }
 
-function withdraw(call: ethereum.Call, vault: VaultStore, withdrawAmount: BigInt, sharesBurnt: BigInt): void {
-  const token = getOrCreateToken(Address.fromString(vault.inputTokens[0]))
-  let amountUSD = normalizedUsdcPrice(usdcPrice(token, withdrawAmount))
+export function handleStrategyReported_v1(
+  event: OldStrategyReportedEvent
+): void {
+  const vaultAddress = event.address;
+  const strategyAddress = event.params.strategy;
 
-  const vaultContract = VaultContract.bind(call.to)
-  const tvl = vaultContract.totalAssets()
-  vault.totalValueLockedUSD = normalizedUsdcPrice(usdcPrice(token, tvl))
-
-  vault.outputTokenSupply = vault.outputTokenSupply.minus(sharesBurnt.toBigDecimal());
-  vault.inputTokenBalances = [vault.inputTokenBalances[0].minus(withdrawAmount.toBigDecimal())];
-  vault.save();
-
-  getOrCreateWithdrawTransactionFromCall(call, withdrawAmount.toBigDecimal(), amountUSD, 'vault.withdraw()')
-}
-
-export function getOrCreateDepositTransactionFromCall(
-  call: ethereum.Call,
-  amount: BigDecimal,
-  amountUSD: BigDecimal,
-  action: string
-): DepositTransaction {
-  log.debug(
-    '[Transaction] Get or create deposit transaction hash {} from call action {}, to {}',
-    [call.transaction.hash.toHexString(), action, call.to.toHexString()]
+  strategyReported(
+    event.params.gain,
+    event.params.debtAdded,
+    event.params.debtPaid,
+    event.params.totalDebt,
+    event,
+    vaultAddress,
+    strategyAddress
   );
-
-  let tx = call.transaction
-  let id = "deposit-" + tx.hash.toHexString()
-  let transaction = DepositTransaction.load(id);
-  if (transaction == null) {
-    transaction = new DepositTransaction(id);
-    transaction.logIndex = tx.index.toI32();
-    transaction.to = call.to.toHexString()
-    transaction.from = tx.from.toHexString();
-    transaction.hash = tx.hash.toHexString();
-    transaction.timestamp = getTimestampInMillis(call.block);
-    transaction.blockNumber = call.block.number;
-    transaction.protocol = PROTOCOL_ID
-    transaction.vault = call.to.toHexString()
-
-    const vault = VaultStore.load(call.to.toHexString())
-    if (vault) {
-      transaction.asset = vault.inputTokens[0]
-    }
-    transaction.amount = amount
-    transaction.amountUSD = amountUSD
-    transaction.save()
-  }
-  return transaction;
 }
 
-export function getOrCreateWithdrawTransactionFromCall(
-  call: ethereum.Call,
-  amount: BigDecimal,
-  amountUSD: BigDecimal,
-  action: string
-): WithdrawTransaction {
-  log.debug(
-    '[Transaction] Get or create withdraw transaction hash {} from call action {}, to {}',
-    [call.transaction.hash.toHexString(), action, call.to.toHexString()]
+export function handleStrategyReported_v2(
+  event: NewStrategyReportedEvent
+): void {
+  const vaultAddress = event.address;
+  const strategyAddress = event.params.strategy;
+
+  strategyReported(
+    event.params.gain,
+    event.params.debtAdded,
+    constants.BIGINT_ZERO,
+    event.params.totalDebt,
+    event,
+    vaultAddress,
+    strategyAddress
   );
-
-  let tx = call.transaction
-  let id = "withdraw-" + tx.hash.toHexString()
-  let transaction = WithdrawTransaction.load(id);
-  if (transaction == null) {
-    transaction = new WithdrawTransaction(id);
-    transaction.logIndex = tx.index.toI32();
-    transaction.to = call.to.toHexString()
-    transaction.from = tx.from.toHexString();
-    transaction.hash = tx.hash.toHexString();
-    transaction.timestamp = getTimestampInMillis(call.block);
-    transaction.blockNumber = call.block.number;
-    transaction.protocol = PROTOCOL_ID
-    transaction.vault = call.to.toHexString()
-
-    const vault = VaultStore.load(call.to.toHexString())
-    if (vault) {
-      transaction.asset = vault.inputTokens[0]
-    }
-    transaction.amount = amount
-    transaction.amountUSD = amountUSD
-    transaction.save()
-  }
-  return transaction;
 }
 
-/* Calculates the amount of tokens deposited via totalAssets/totalSupply arithmetic. */
-function calculateAmountDeposited(
-  vaultAddress: Address,
-  sharesMinted: BigInt
-): BigInt {
-  let vaultContract = VaultContract.bind(vaultAddress);
-  let totalAssets = vaultContract.totalAssets();
-  let totalSupply = vaultContract.totalSupply();
-  let amount = totalSupply.isZero()
-    ? BIGINT_ZERO
-    : sharesMinted.times(totalAssets).div(totalSupply);
-  log.info(
-    '[Vault] Indirectly calculating token qty deposited. shares minted: {} - total assets {} - total supply {} - calc deposited tokens: {}',
-    [
-      sharesMinted.toString(),
-      totalAssets.toString(),
-      totalSupply.toString(),
-      amount.toString(),
-    ]
-  );
-  return amount;
+export function handleDepositEvent(event: DepositEvent): void {
+  const vaultAddress = event.address;
+  const vault = getOrCreateVault(vaultAddress, event.block);
+
+  if (vault) {
+    let sharesMinted = event.params.shares;
+
+    _Deposit(
+      event.address,
+      event.transaction,
+      event.block,
+      vault,
+      sharesMinted,
+      event.params.amount
+    );
+  }
+  updateFinancials(event.block);
+  updateUsageMetrics(event.block, event.params.recipient);
+  updateVaultSnapshots(vaultAddress, event.block);
 }
 
-function updateFinancials(blockNumber: BigInt, timestamp: BigInt, from: Address): void {
-  // Number of days since Unix epoch
-  let id: i64 = timestamp.toI64() / SECONDS_PER_DAY;
-  let financialMetrics = FinancialsDailySnapshot.load(id.toString());
+export function handleWithdrawEvent(event: WithdrawEvent): void {
+  const vaultAddress = event.address;
+  const vault = getOrCreateVault(vaultAddress, event.block);
 
-  if (!financialMetrics) {
-    financialMetrics = new FinancialsDailySnapshot(id.toString());
-    financialMetrics.protocol = PROTOCOL_ID;
+  if (vault) {
+    const sharesBurnt = event.params.shares;
+    const withdrawAmount = event.params.amount;
 
-    financialMetrics.feesUSD = BIGDECIMAL_ZERO
-    financialMetrics.totalVolumeUSD = BIGDECIMAL_ZERO
-    financialMetrics.totalValueLockedUSD = BIGDECIMAL_ZERO
-    financialMetrics.supplySideRevenueUSD = BIGDECIMAL_ZERO
-    financialMetrics.protocolSideRevenueUSD = BIGDECIMAL_ZERO
+    _Withdraw(
+      event.address,
+      event.transaction,
+      event.block,
+      vault,
+      withdrawAmount,
+      sharesBurnt
+    );
   }
-
-  let protocolTvlUsd = BIGDECIMAL_ZERO
-  const protocol = YieldAggregator.load(PROTOCOL_ID)
-  if (protocol) {
-    for (let i = 0; i < protocol.vaultIds.length; i++) {
-      const vaultId = protocol.vaultIds[i]
-      const vaultContract = VaultContract.bind(Address.fromString(vaultId))
-      const vaultTvl = vaultContract.totalAssets()
-      const token = getOrCreateToken(vaultContract.token())
-      const vaultTvlUsd = normalizedUsdcPrice(usdcPrice(token, vaultTvl))
-      protocolTvlUsd = protocolTvlUsd.plus(vaultTvlUsd)
-    }
-    financialMetrics.totalValueLockedUSD = protocolTvlUsd
-  }
-  
-  // Update the block number and timestamp to that of the last transaction of that day
-  financialMetrics.blockNumber = blockNumber;
-  financialMetrics.timestamp = timestamp;
-
-  financialMetrics.save();
-}
-
-
-function updateUsageMetrics(blockNumber: BigInt, timestamp: BigInt, from: Address): void {
-  // Number of days since Unix epoch
-  let id: i64 = timestamp.toI64() / SECONDS_PER_DAY;
-  let usageMetrics = UsageMetricsDailySnapshot.load(id.toString());
-
-  if (!usageMetrics) {
-    usageMetrics = new UsageMetricsDailySnapshot(id.toString());
-    usageMetrics.protocol = PROTOCOL_ID;
-
-    usageMetrics.activeUsers = 0;
-    usageMetrics.totalUniqueUsers = 0;
-    usageMetrics.dailyTransactionCount = 0;
-  }
-  
-  // Update the block number and timestamp to that of the last transaction of that day
-  usageMetrics.blockNumber = blockNumber;
-  usageMetrics.timestamp = timestamp;
-  usageMetrics.dailyTransactionCount += 1;
-
-  let accountId = from.toHexString()
-  let account = _Account.load(accountId)
-  if (!account) {
-    account = new _Account(accountId);
-    account.save();
-    usageMetrics.totalUniqueUsers += 1;
-  }
-
-  // Combine the id and the user address to generate a unique user id for the day
-  let dailyActiveAccountId = id.toString() + "-" + from.toHexString()
-  let dailyActiveAccount = _DailyActiveAccount.load(dailyActiveAccountId);
-  if (!dailyActiveAccount) {
-    dailyActiveAccount = new _DailyActiveAccount(dailyActiveAccountId);
-    dailyActiveAccount.save();
-    usageMetrics.activeUsers += 1;
-  }
-
-  usageMetrics.save();
+  updateFinancials(event.block);
+  updateUsageMetrics(event.block, event.transaction.from);
+  updateVaultSnapshots(vaultAddress, event.block);
 }
